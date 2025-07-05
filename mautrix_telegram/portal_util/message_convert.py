@@ -322,7 +322,9 @@ class TelegramMessageConverter:
             if deterministic_id:
                 content.set_reply(self.deterministic_event_id(space, reply_to_id))
             return
-        elif msg.mx_room != self.portal.mxid and not self.config["bridge.cross_room_replies"]:
+        elif msg.mx_room != self.portal.mxid \
+            and not msg.mx_room in self.portal.forum_mxids \
+            and not self.config["bridge.cross_room_replies"]:
             return
         elif not isinstance(content, TextMessageEventContent) or no_fallback:
             # Not a text message, just set the reply metadata and return
@@ -343,7 +345,7 @@ class TelegramMessageConverter:
         except Exception:
             self.log.exception("Failed to get event to add reply fallback")
             content.set_reply(msg.mxid)
-        if msg.mx_room != self.portal.mxid:
+        if msg.mx_room != self.portal.mxid and not msg.mx_room in self.portal.forum_mxids:
             content.relates_to.in_reply_to["room_id"] = msg.mx_room
 
     @staticmethod

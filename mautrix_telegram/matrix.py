@@ -15,15 +15,18 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 import sys
 
-from mautrix.bridge import BaseMatrixHandler
+from mautrix.bridge import BasePortal, BaseMatrixHandler
+from mautrix.bridge.matrix import UnencryptedMessageError
 from mautrix.types import (
     Event,
     EventID,
     EventType,
     MemberStateEventContent,
+    MessageEvent,
     PresenceEvent,
     PresenceState,
     ReactionEvent,
@@ -36,10 +39,12 @@ from mautrix.types import (
     SingleReceiptEventContent,
     StateEvent,
     TypingEvent,
-    UserID,
+    UserID, TextMessageEventContent, MessageType, MessageStatus, MessageStatusReason,
 )
+from mautrix.util.message_send_checkpoint import MessageSendCheckpointStep, \
+    MessageSendCheckpointStatus, MessageSendCheckpointReportedBy
 
-from . import commands as com, portal as po, puppet as pu, user as u
+from . import commands as com, portal as po, portal_forum_mapping as pfm, puppet as pu, user as u
 from .commands.portal.util import get_initial_state, user_has_power_level, warn_missing_power
 from .types import TelegramID
 

@@ -20,6 +20,7 @@ from .bot_chat import BotChat
 from .disappearing_message import DisappearingMessage
 from .message import Message
 from .portal import Portal
+from .portal_forum_mapping import PortalForumMapping
 from .puppet import Puppet
 from .reaction import Reaction
 from .telegram_file import TelegramFile
@@ -31,6 +32,7 @@ from .user import User
 def init(db: Database) -> None:
     for table in (
         Portal,
+        PortalForumMapping,
         Message,
         Reaction,
         User,
@@ -48,6 +50,7 @@ __all__ = [
     "upgrade_table",
     "init",
     "Portal",
+    "PortalForumMapping",
     "Message",
     "Reaction",
     "User",

@@ -563,6 +563,15 @@ bridge:
         # users. This behavior is usually not desirable, as it interferes with manually bridging
         # the chat to another room.
         ignore_unbridged_group_chat: true
+        # Should events from unbridged forums/threads be ignored by default?
+        # If false, events from all forums/threads will be redirected to the main portal.
+        ignore_unbridged_forums: true
+        # Should channels that are bridged to forum topics listen to topic name changes?
+        # If set to `default`, this will only be enabled when the `forum_room_prefix`
+        #                      config value is set in the main portal room.
+        # If set to `always`, all forum name changes will be bridged.
+        # If set to `never`, forum name changes will be ignored entirely.
+        forum_update_title: default
         # Whether or not to allow creating portals from Telegram.
         authless_portals: true
         # Whether or not to allow Telegram group admins to use the bot commands.

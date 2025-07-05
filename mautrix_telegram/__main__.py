@@ -27,6 +27,7 @@ from .config import Config
 from .db import init as init_db, upgrade_table
 from .matrix import MatrixHandler
 from .portal import Portal
+from .portal_forum_mapping import PortalForumMapping
 from .puppet import Puppet
 from .user import User
 from .version import linkified_version, version
@@ -114,8 +115,15 @@ class TelegramBridge(Bridge):
             await user.ensure_started()
         return user
 
-    async def get_portal(self, room_id: RoomID) -> Portal | None:
-        return await Portal.get_by_mxid(room_id)
+    async def get_portal(self, room_id: RoomID | None = None) -> Portal | None:
+        if not room_id:
+            return None
+        portal = await Portal.get_by_mxid(room_id)
+        if not portal:
+            forum_mapping = await PortalForumMapping.get_by_mxid(room_id)
+            if forum_mapping:
+                portal = await Portal.get_by_tgid(forum_mapping.portal_tgid)
+        return portal
 
     async def get_puppet(self, user_id: UserID, create: bool = False) -> Puppet | None:
         return await Puppet.get_by_mxid(user_id, create=create)

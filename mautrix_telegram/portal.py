@@ -173,7 +173,8 @@ from telethon.tl.types import (
     UserEmpty,
     UserFull,
     UserProfilePhoto,
-    UserProfilePhotoEmpty,
+    UserProfilePhotoEmpty, MessageReplyHeader, InputMessageID, InputReplyToMessage,
+    MessageActionTopicEdit,
 )
 from telethon.tl.types.messages import PeerDialogs
 from telethon.utils import encode_waveform, get_peer_id
@@ -225,6 +226,7 @@ from . import (
     abstract_user as au,
     formatter,
     matrix as m,
+    portal_forum_mapping as pfm,
     portal_util as putil,
     puppet as p,
     user as u,
@@ -237,6 +239,7 @@ from .db import (
     DisappearingMessage,
     Message as DBMessage,
     Portal as DBPortal,
+    PortalForumMapping as DBPortalForumMapping,
     Reaction as DBReaction,
     TelegramFile as DBTelegramFile,
 )
@@ -310,6 +313,12 @@ class Portal(DBPortal, BasePortal):
     backfill_enable: bool
 
     alias: RoomAlias | None
+
+    forum_by_id: dict[int, pfm.PortalForumMapping]
+    forum_by_mxid: dict[RoomID, pfm.PortalForumMapping]
+    forum_by_tgid: dict[tuple[TelegramID, TelegramID], pfm.PortalForumMapping]
+    forum_mxids: list[RoomID]
+    tgid_by_mxid: dict[RoomID, tuple[TelegramID, TelegramID]]
 
     dedup: putil.PortalDedup
     send_lock: putil.PortalSendLock
@@ -385,6 +394,12 @@ class Portal(DBPortal, BasePortal):
             "Waiting for backfilling to finish before handling %s", log=self.log
         )
         self.backfill_method_lock = asyncio.Lock()
+
+        self.forum_by_id = {}
+        self.forum_by_mxid = {}
+        self.forum_by_tgid = {}
+        self.forum_mxids = []
+        self.tgid_by_mxid = {}
 
         self.dedup = putil.PortalDedup(self)
         self.send_lock = putil.PortalSendLock()
@@ -526,7 +541,11 @@ class Portal(DBPortal, BasePortal):
         user_tgids = {}
         users = []
         intent = self.az.intent if pre_create else self.main_intent
-        user_mxids = await intent.get_room_members(self.mxid, (Membership.JOIN, Membership.INVITE))
+        user_mxids = []
+        for mxid in list(self.forum_by_mxid.keys()):
+            for user_mxid in await intent.get_room_members(mxid, (Membership.JOIN, Membership.INVITE)):
+                if not user_mxid in user_mxids:
+                    user_mxids.append(user_mxid)
         for mxid in user_mxids:
             if mxid == self.az.bot_mxid:
                 continue
@@ -706,14 +725,15 @@ class Portal(DBPortal, BasePortal):
                 await self.invite_to_matrix(user)
         else:
             puppet = await p.Puppet.get_by_custom_mxid(users)
-            await self.main_intent.invite_user(
-                self.mxid, users, check_cache=True, extra_content=self._get_invite_content(puppet)
-            )
-            if puppet:
-                try:
-                    await puppet.intent.ensure_joined(self.mxid)
-                except Exception:
-                    self.log.exception("Failed to ensure %s is joined to portal", users)
+            for mxid in [self.mxid, *self.forum_by_mxid.keys()]:
+                await self.main_intent.invite_user(
+                    mxid, users, check_cache=True, extra_content=self._get_invite_content(puppet)
+                )
+                if puppet:
+                    try:
+                        await puppet.intent.ensure_joined(mxid)
+                    except Exception:
+                        self.log.exception("Failed to ensure %s is joined to portal", users)
 
     async def update_matrix_room(
         self,
@@ -841,6 +861,7 @@ class Portal(DBPortal, BasePortal):
         return info
 
     async def update_bridge_info(self) -> None:
+        # TODO: update bridge info?
         if not self.mxid:
             self.log.debug("Not updating bridge info: no Matrix room created")
             return
@@ -1105,13 +1126,15 @@ class Portal(DBPortal, BasePortal):
         if not levels:
             levels = await self.main_intent.get_power_levels(self.mxid)
         if await putil.participants_to_power_levels(self, users, levels):
-            await self.main_intent.set_power_levels(self.mxid, levels)
+            for mxid in [self.mxid, *self.forum_by_mxid.keys()]:
+                await self.main_intent.set_power_levels(mxid, levels)
 
     async def update_default_banned_rights(self, dbr: ChatBannedRights) -> None:
         self.log.debug("Default rights in chat changed: %s", dbr)
         levels = await self.main_intent.get_power_levels(self.mxid)
         levels = putil.get_base_power_levels(self, levels, dbr=dbr)
-        await self.main_intent.set_power_levels(self.mxid, levels)
+        for mxid in [self.mxid, *self.forum_by_mxid.keys()]:
+            await self.main_intent.set_power_levels(mxid, levels)
 
     async def _add_bot_chat(self, bot: User) -> None:
         if self.bot and bot.id == self.bot.tgid:
@@ -1142,7 +1165,8 @@ class Portal(DBPortal, BasePortal):
                 continue
 
             if self.mxid:
-                await puppet.intent_for(self).ensure_joined(self.mxid)
+                for mxid in [self.mxid, *self.forum_by_mxid.keys()]:
+                    await puppet.intent_for(self).ensure_joined(mxid)
             else:
                 join_mxids.add(puppet.intent_for(self).mxid)
 
@@ -1175,38 +1199,39 @@ class Portal(DBPortal, BasePortal):
         if not trust_member_list:
             return None
 
-        for user_mxid in await self.main_intent.get_room_members(self.mxid):
-            if user_mxid == self.az.bot_mxid:
-                continue
-
-            puppet = await p.Puppet.get_by_mxid(user_mxid)
-            if puppet:
-                # TODO figure out when/how to clean up channels from the member list
-                if puppet.id in allowed_tgids or puppet.is_channel:
+        for mxid in [self.mxid, *self.forum_by_mxid.keys()]:
+            for user_mxid in await self.main_intent.get_room_members(mxid):
+                if user_mxid == self.az.bot_mxid:
                     continue
-                if self.bot and puppet.id == self.bot.tgid:
-                    await self.bot.remove_chat(self.tgid)
-                try:
-                    await self.main_intent.kick_user(
-                        self.mxid, user_mxid, "User had left this Telegram chat."
-                    )
-                except MForbidden:
-                    pass
-                continue
 
-            mx_user = await u.User.get_by_mxid(user_mxid, create=False)
-            if mx_user:
-                if mx_user.tgid in allowed_tgids:
-                    continue
-                if mx_user.is_bot:
-                    await mx_user.unregister_portal(*self.tgid_full)
-                if not self.has_bot and mx_user.tgid:
+                puppet = await p.Puppet.get_by_mxid(user_mxid)
+                if puppet:
+                    # TODO figure out when/how to clean up channels from the member list
+                    if puppet.id in allowed_tgids or puppet.is_channel:
+                        continue
+                    if self.bot and puppet.id == self.bot.tgid:
+                        await self.bot.remove_chat(self.tgid)
                     try:
                         await self.main_intent.kick_user(
-                            self.mxid, mx_user.mxid, "You had left this Telegram chat."
+                            mxid, user_mxid, "User had left this Telegram chat."
                         )
                     except MForbidden:
                         pass
+                    continue
+
+                mx_user = await u.User.get_by_mxid(user_mxid, create=False)
+                if mx_user:
+                    if mx_user.tgid in allowed_tgids:
+                        continue
+                    if mx_user.is_bot:
+                        await mx_user.unregister_portal(*self.tgid_full)
+                    if not self.has_bot and mx_user.tgid:
+                        try:
+                            await self.main_intent.kick_user(
+                                mxid, mx_user.mxid, "You had left this Telegram chat."
+                            )
+                        except MForbidden:
+                            pass
 
         return None
 
@@ -1223,7 +1248,8 @@ class Portal(DBPortal, BasePortal):
                 )
                 return
             await puppet.update_info(source, entity)
-            await puppet.intent_for(self).ensure_joined(self.mxid)
+            for mxid in [self.mxid, *self.forum_by_mxid.keys()]:
+                await puppet.intent_for(self).ensure_joined(mxid)
 
         user = await u.User.get_by_tgid(user_id)
         if user:
@@ -1243,32 +1269,33 @@ class Portal(DBPortal, BasePortal):
         puppet_extra_content = None
         if sender.is_real_user:
             puppet_extra_content = {DOUBLE_PUPPET_SOURCE_KEY: self.bridge.name}
-        if sender.tgid != puppet.tgid:
-            try:
-                await sender.intent_for(self).kick_user(
-                    self.mxid, puppet.mxid, extra_content=puppet_extra_content
-                )
-            except MForbidden:
-                try:
-                    await self.main_intent.kick_user(self.mxid, puppet.mxid, kick_message)
-                except MForbidden as e:
-                    self.log.warning(f"Failed to kick {puppet.mxid}: {e}")
-        elif await self.az.state_store.is_joined(self.mxid, puppet.intent_for(self).mxid):
-            await puppet.intent_for(self).leave_room(self.mxid, extra_content=puppet_extra_content)
-        if user:
-            await user.unregister_portal(*self.tgid_full)
+        for mxid in [self.mxid, *self.forum_by_mxid.keys()]:
             if sender.tgid != puppet.tgid:
                 try:
                     await sender.intent_for(self).kick_user(
-                        self.mxid, user.mxid, extra_content=puppet_extra_content
+                        mxid, puppet.mxid, extra_content=puppet_extra_content
                     )
-                    return
                 except MForbidden:
-                    pass
-            try:
-                await self.main_intent.kick_user(self.mxid, user.mxid, kick_message)
-            except MForbidden as e:
-                self.log.warning(f"Failed to kick {user.mxid}: {e}")
+                    try:
+                        await self.main_intent.kick_user(mxid, puppet.mxid, kick_message)
+                    except MForbidden as e:
+                        self.log.warning(f"Failed to kick {puppet.mxid}: {e}")
+            elif await self.az.state_store.is_joined(mxid, puppet.intent_for(self).mxid):
+                await puppet.intent_for(self).leave_room(mxid, extra_content=puppet_extra_content)
+            if user:
+                await user.unregister_portal(*self.tgid_full)
+                if sender.tgid != puppet.tgid:
+                    try:
+                        await sender.intent_for(self).kick_user(
+                            mxid, user.mxid, extra_content=puppet_extra_content
+                        )
+                        return
+                    except MForbidden:
+                        pass
+                try:
+                    await self.main_intent.kick_user(mxid, user.mxid, kick_message)
+                except MForbidden as e:
+                    self.log.warning(f"Failed to kick {user.mxid}: {e}")
 
     async def update_info(
         self,
@@ -1328,18 +1355,18 @@ class Portal(DBPortal, BasePortal):
         return True
 
     async def _try_set_state(
-        self, sender: p.Puppet | None, evt_type: EventType, content: StateEventContent
+        self, room_id: RoomID, sender: p.Puppet | None, evt_type: EventType, content: StateEventContent
     ) -> None:
         if sender:
             try:
                 intent = sender.intent_for(self)
                 if sender.is_real_user:
                     content[DOUBLE_PUPPET_SOURCE_KEY] = self.bridge.name
-                await intent.send_state_event(self.mxid, evt_type, content)
+                await intent.send_state_event(room_id, evt_type, content)
             except MForbidden:
-                await self.main_intent.send_state_event(self.mxid, evt_type, content)
+                await self.main_intent.send_state_event(room_id, evt_type, content)
         else:
-            await self.main_intent.send_state_event(self.mxid, evt_type, content)
+            await self.main_intent.send_state_event(room_id, evt_type, content)
 
     async def _update_about(
         self, about: str, sender: p.Puppet | None = None, save: bool = False
@@ -1350,7 +1377,7 @@ class Portal(DBPortal, BasePortal):
         self.about = about
         if self.mxid:
             await self._try_set_state(
-                sender, EventType.ROOM_TOPIC, RoomTopicStateEventContent(topic=self.about)
+                self.mxid, sender, EventType.ROOM_TOPIC, RoomTopicStateEventContent(topic=self.about)
             )
         if save:
             await self.save()
@@ -1367,13 +1394,45 @@ class Portal(DBPortal, BasePortal):
         if self.mxid and self.set_dm_room_metadata:
             try:
                 await self._try_set_state(
-                    sender, EventType.ROOM_NAME, RoomNameStateEventContent(name=self.title)
+                    self.mxid, sender, EventType.ROOM_NAME, RoomNameStateEventContent(name=self.title)
                 )
                 self.name_set = True
             except Exception as e:
                 self.log.warning(f"Failed to set room name: {e}")
         if save:
             await self.save()
+        return True
+
+    async def _update_topic(
+        self, forum_id: int, title: str, sender: p.Puppet | None = None, save: bool = False
+    ) -> bool:
+        if not forum_id in self.forum_by_id:
+            return False
+
+        forum_update_title = self.config["bridge.relaybot.forum_update_title"] or "default"
+        if forum_update_title == "never":
+            return False
+
+        forum_room_prefix = self.get_config("forum_room_prefix")
+        if not forum_room_prefix and forum_update_title == "default":
+            self.log.trace(f"No forum prefix set, ignoring title update: {forum_id} -> {title}")
+            return False
+
+        forum_mapping = self.forum_by_id[forum_id]
+        if forum_mapping.title == title:
+            return False
+
+        forum_mapping.title = title
+        if forum_mapping.mxid:
+            room_name = (forum_room_prefix or "") + forum_mapping.title
+            try:
+                await self._try_set_state(
+                    forum_mapping.mxid, sender, EventType.ROOM_NAME, RoomNameStateEventContent(name=room_name)
+                )
+            except Exception as e:
+                self.log.warning(f"Failed to set room name: {e}")
+        if save:
+            await forum_mapping.save()
         return True
 
     async def _update_avatar_from_puppet(
@@ -1388,6 +1447,7 @@ class Portal(DBPortal, BasePortal):
             if self.mxid and self.set_dm_room_metadata:
                 try:
                     await self._try_set_state(
+                        self.mxid,
                         None,
                         EventType.ROOM_AVATAR,
                         RoomAvatarStateEventContent(url=self.avatar_url),
@@ -1446,6 +1506,7 @@ class Portal(DBPortal, BasePortal):
             if self.mxid:
                 try:
                     await self._try_set_state(
+                        self.mxid,
                         sender,
                         EventType.ROOM_AVATAR,
                         RoomAvatarStateEventContent(url=self.avatar_url),
@@ -1558,7 +1619,7 @@ class Portal(DBPortal, BasePortal):
                 f"Redacting old sponsored {self.sponsored_event_id}"
                 " in preparation for sending new one"
             )
-            await self.main_intent.redact(self.mxid, self.sponsored_event_id)
+            await self.main_intent.redact(self.mxid, self.sponsored_event_id) # TODO: mxid
         content = await putil.make_sponsored_message_content(user, msg, entity)
         self.log.trace("Sending sponsored message")
         self.sponsored_event_id = await self._send_message(self.main_intent, content)
@@ -1616,6 +1677,7 @@ class Portal(DBPortal, BasePortal):
             )
 
     async def mark_read(self, user: u.User, event_id: EventID, timestamp: int) -> None:
+        # TODO: mxid
         if user.is_bot:
             return
         space = self.tgid if self.peer_type == "channel" else user.tgid
@@ -1680,6 +1742,7 @@ class Portal(DBPortal, BasePortal):
             await source.client.edit_permissions(self.peer, user.peer, view_messages=False)
 
     async def leave_matrix(self, user: u.User, event_id: EventID) -> None:
+        # TODO: mxid
         if await user.needs_relaybot(self):
             await self._send_state_change_message("leave", user, event_id)
             return
@@ -1782,6 +1845,7 @@ class Portal(DBPortal, BasePortal):
         self,
         sender: u.User,
         logged_in: bool,
+        room_id: RoomID,
         event_id: EventID,
         space: TelegramID,
         client: MautrixTelegramClient,
@@ -1795,7 +1859,7 @@ class Portal(DBPortal, BasePortal):
         async with self.send_lock(sender_id):
             lp = self.get_config("telegram_link_preview")
             if content.get_edit():
-                orig_msg = await DBMessage.get_by_mxid(content.get_edit(), self.mxid, space)
+                orig_msg = await DBMessage.get_by_mxid(content.get_edit(), room_id, space)
                 if orig_msg:
                     resp = await client.edit_message(
                         self.peer,
@@ -1808,6 +1872,7 @@ class Portal(DBPortal, BasePortal):
                         sender=sender,
                         sender_tgid=sender_id,
                         event_type=EventType.ROOM_MESSAGE,
+                        room_id=room_id,
                         event_id=event_id,
                         space=space,
                         edit_index=-1,
@@ -1826,6 +1891,7 @@ class Portal(DBPortal, BasePortal):
                 sender=sender,
                 sender_tgid=sender_id,
                 event_type=EventType.ROOM_MESSAGE,
+                room_id=room_id,
                 event_id=event_id,
                 space=space,
                 edit_index=0,
@@ -1838,6 +1904,7 @@ class Portal(DBPortal, BasePortal):
         sender: u.User,
         logged_in: bool,
         event_id: EventID,
+        room_id: RoomID,
         space: TelegramID,
         client: MautrixTelegramClient,
         content: MediaMessageEventContent,
@@ -1941,7 +2008,7 @@ class Portal(DBPortal, BasePortal):
 
         async with self.send_lock(sender_id):
             if await self._matrix_document_edit(
-                sender, sender_id, client, content, space, capt, entities, media, event_id
+                sender, sender_id, client, content, room_id, space, capt, entities, media, event_id
             ):
                 return
             try:
@@ -1967,6 +2034,7 @@ class Portal(DBPortal, BasePortal):
                     sender=sender,
                     sender_tgid=sender_id,
                     event_type=EventType.ROOM_MESSAGE,
+                    room_id=room_id,
                     event_id=event_id,
                     space=space,
                     edit_index=0,
@@ -1980,6 +2048,7 @@ class Portal(DBPortal, BasePortal):
         sender_tgid: TelegramID,
         client: MautrixTelegramClient,
         content: MessageEventContent,
+        room_id: RoomID,
         space: TelegramID,
         caption: str,
         caption_entities,
@@ -1987,7 +2056,7 @@ class Portal(DBPortal, BasePortal):
         event_id: EventID,
     ) -> bool:
         if content.get_edit():
-            orig_msg = await DBMessage.get_by_mxid(content.get_edit(), self.mxid, space)
+            orig_msg = await DBMessage.get_by_mxid(content.get_edit(), room_id, space)
             if orig_msg:
                 response = await client.edit_message(
                     self.peer,
@@ -2000,6 +2069,7 @@ class Portal(DBPortal, BasePortal):
                     sender=sender,
                     sender_tgid=sender_tgid,
                     event_type=EventType.ROOM_MESSAGE,
+                    room_id=room_id,
                     event_id=event_id,
                     space=space,
                     edit_index=-1,
@@ -2013,6 +2083,7 @@ class Portal(DBPortal, BasePortal):
         self,
         sender: u.User,
         logged_in: bool,
+        room_id: RoomID,
         event_id: EventID,
         space: TelegramID,
         client: MautrixTelegramClient,
@@ -2035,7 +2106,7 @@ class Portal(DBPortal, BasePortal):
 
         async with self.send_lock(sender_id):
             if await self._matrix_document_edit(
-                sender, sender_id, client, content, space, caption, entities, media, event_id
+                sender, sender_id, client, content, room_id, space, caption, entities, media, event_id
             ):
                 return
             try:
@@ -2049,6 +2120,7 @@ class Portal(DBPortal, BasePortal):
                     sender=sender,
                     sender_tgid=sender_id,
                     event_type=EventType.ROOM_MESSAGE,
+                    room_id=room_id,
                     event_id=event_id,
                     space=space,
                     edit_index=0,
@@ -2061,6 +2133,7 @@ class Portal(DBPortal, BasePortal):
         sender: u.User,
         sender_tgid: TelegramID,
         event_type: EventType,
+        room_id: RoomID,
         event_id: EventID,
         space: TelegramID,
         edit_index: int,
@@ -2075,7 +2148,7 @@ class Portal(DBPortal, BasePortal):
         await DBMessage(
             tgid=TelegramID(response.id),
             tg_space=space,
-            mx_room=self.mxid,
+            mx_room=room_id,
             mxid=event_id,
             edit_index=edit_index,
             content_hash=event_hash,
@@ -2084,8 +2157,8 @@ class Portal(DBPortal, BasePortal):
         ).insert()
         sender.send_remote_checkpoint(
             MessageSendCheckpointStatus.SUCCESS,
+            room_id,
             event_id,
-            self.mxid,
             event_type,
             message_type=msgtype,
         )
@@ -2093,6 +2166,7 @@ class Portal(DBPortal, BasePortal):
         background_task.create(self._send_message_status(event_id, err=None))
         if response.ttl_period:
             await self._mark_disappearing(
+                room_id=room_id,
                 event_id=event_id,
                 seconds=response.ttl_period,
                 expires_at=int(response.date.timestamp()) + response.ttl_period,
@@ -2184,10 +2258,10 @@ class Portal(DBPortal, BasePortal):
         await self._send_message_status(event_id, err)
 
     async def handle_matrix_message(
-        self, sender: u.User, content: MessageEventContent, event_id: EventID
+        self, sender: u.User, content: MessageEventContent, room_id: RoomID, event_id: EventID
     ) -> None:
         try:
-            await self._handle_matrix_message(sender, content, event_id)
+            await self._handle_matrix_message(sender, content, room_id, event_id)
         except RPCError as e:
             self.log.exception(f"RPCError while bridging {event_id}: {e}")
             await self._send_bridge_error(
@@ -2281,7 +2355,7 @@ class Portal(DBPortal, BasePortal):
                 return True
 
     async def _handle_matrix_message(
-        self, sender: u.User, content: MessageEventContent, event_id: EventID
+        self, sender: u.User, content: MessageEventContent, room_id: RoomID, event_id: EventID
     ) -> None:
         if not content.msgtype:
             raise IgnoredMessageError("Message doesn't have a msgtype")
@@ -2300,7 +2374,19 @@ class Portal(DBPortal, BasePortal):
             sender, source_msg, event_id, space, content.msgtype
         ):
             return
-        reply_to = await formatter.matrix_reply_to_telegram(content, space, room_id=self.mxid)
+        reply_to = await formatter.matrix_reply_to_telegram(content, space, room_id)
+
+        reply_to_msg_id = reply_to
+        reply_to_top_id = None
+        if room_id in self.forum_by_mxid:
+            forum_mapping = self.forum_by_mxid[room_id]
+            if not reply_to_msg_id:
+                reply_to_msg_id = forum_mapping.tg_forum_id
+            else:
+                reply_to_top_id = forum_mapping.tg_forum_id
+
+        if reply_to_msg_id:
+            reply_to = InputReplyToMessage(reply_to_msg_id=reply_to_msg_id, top_msg_id=reply_to_top_id)
 
         media = (
             MessageType.STICKER,
@@ -2319,19 +2405,19 @@ class Portal(DBPortal, BasePortal):
         if content.msgtype in (MessageType.TEXT, MessageType.EMOTE, MessageType.NOTICE):
             await self._pre_process_matrix_message(sender, not logged_in, content)
             await self._handle_matrix_text(
-                sender, logged_in, event_id, space, client, content, reply_to
+                sender, logged_in, room_id, event_id, space, client, content, reply_to
             )
         elif content.msgtype == MessageType.LOCATION:
             await self._pre_process_matrix_message(sender, not logged_in, content)
             await self._handle_matrix_location(
-                sender, logged_in, event_id, space, client, content, reply_to
+                sender, logged_in, room_id, event_id, space, client, content, reply_to
             )
         elif content.msgtype in media:
             file_name = content.body
             try:
                 caption_content: TextMessageEventContent | None = sender.command_status["caption"]
                 reply_to = reply_to or await formatter.matrix_reply_to_telegram(
-                    caption_content, space, room_id=self.mxid
+                    caption_content, space, room_id=room_id
                 )
                 sender.command_status = None
             except (KeyError, TypeError):
@@ -2375,13 +2461,13 @@ class Portal(DBPortal, BasePortal):
         await self._send_delivery_receipt(pin_event_id)
 
     async def handle_matrix_pin(
-        self, sender: u.User, changes: dict[EventID, bool], pin_event_id: EventID
+        self, sender: u.User, changes: dict[EventID, bool], pin_event_id: EventID, room_id: RoomID | None = None
     ) -> None:
         tg_space = self.tgid if self.peer_type == "channel" else sender.tgid
         ids = {
             msg.mxid: msg.tgid
             for msg in await DBMessage.get_by_mxids(
-                list(changes.keys()), mx_room=self.mxid, tg_space=tg_space
+                list(changes.keys()), mx_room=room_id or self.mxid, tg_space=tg_space
             )
         }
         for event_id, pinned in changes.items():
@@ -2394,7 +2480,7 @@ class Portal(DBPortal, BasePortal):
         await self._send_delivery_receipt(pin_event_id)
 
     async def handle_matrix_deletion(
-        self, deleter: u.User, event_id: EventID, redaction_event_id: EventID
+        self, deleter: u.User, event_id: EventID, redaction_event_id: EventID, room_id: RoomID | None = None
     ) -> None:
         try:
             await self._handle_matrix_deletion(deleter, event_id)
@@ -2408,16 +2494,16 @@ class Portal(DBPortal, BasePortal):
             deleter.send_remote_checkpoint(
                 MessageSendCheckpointStatus.SUCCESS,
                 redaction_event_id,
-                self.mxid,
+                room_id or self.mxid,
                 EventType.ROOM_REDACTION,
             )
             await self._send_delivery_receipt(redaction_event_id)
             background_task.create(self._send_message_status(redaction_event_id, err=None))
 
     async def _handle_matrix_reaction_deletion(
-        self, deleter: u.User, event_id: EventID, tg_space: TelegramID
+        self, deleter: u.User, event_id: EventID, tg_space: TelegramID, room_id: RoomID | None = None
     ) -> None:
-        reaction = await DBReaction.get_by_mxid(event_id, self.mxid)
+        reaction = await DBReaction.get_by_mxid(event_id, room_id or self.mxid)
         if not reaction:
             raise IgnoredMessageError(f"Ignoring Matrix redaction of unknown event {event_id}")
         elif reaction.tg_sender != deleter.tgid:
@@ -2445,10 +2531,10 @@ class Portal(DBPortal, BasePortal):
                 f"(new reaction count: {len(new_reactions) if new_reactions else 0})"
             )
 
-    async def _handle_matrix_deletion(self, deleter: u.User, event_id: EventID) -> None:
+    async def _handle_matrix_deletion(self, deleter: u.User, event_id: EventID, room_id: RoomID | None = None) -> None:
         real_deleter = deleter if not await deleter.needs_relaybot(self) else self.bot
         tg_space = self.tgid if self.peer_type == "channel" else real_deleter.tgid
-        message = await DBMessage.get_by_mxid(event_id, self.mxid, tg_space)
+        message = await DBMessage.get_by_mxid(event_id, room_id or self.mxid, tg_space)
         if not message:
             await self._handle_matrix_reaction_deletion(real_deleter, event_id, tg_space)
         elif message.redacted:
@@ -2467,7 +2553,7 @@ class Portal(DBPortal, BasePortal):
             self.log.debug(f"Handled Matrix redaction of {event_id} / {message.tgid}")
 
     async def handle_matrix_reaction(
-        self, user: u.User, target_event_id: EventID, emoji: str, reaction_event_id: EventID
+        self, user: u.User, target_event_id: EventID, emoji: str, reaction_event_id: EventID, room_id: RoomID | None = None
     ) -> None:
         emoji_id = emoji
         reaction = ReactionEmoji(emoticon=variation_selector.remove(emoji))
@@ -2477,7 +2563,7 @@ class Portal(DBPortal, BasePortal):
                 self.log.debug(f"Dropping unknown reaction {emoji} by {user.mxid}")
                 if not self.has_bot:
                     await self.main_intent.redact(
-                        self.mxid, reaction_event_id, reason="Unrecognized custom emoji"
+                        room_id or self.mxid, reaction_event_id, reason="Unrecognized custom emoji"
                     )
                 await self._send_bridge_error(
                     user,
@@ -2515,7 +2601,7 @@ class Portal(DBPortal, BasePortal):
             # Don't redact reactions in relaybot chats, there are usually other Matrix users too.
             if not self.has_bot:
                 await self.main_intent.redact(
-                    self.mxid, reaction_event_id, reason="Emoji not allowed"
+                    room_id, reaction_event_id, reason="Emoji not allowed"
                 )
             self.log.debug(f"Failed to bridge reaction by {user.mxid}: emoji not allowed")
             await self._send_bridge_error(user, e, reaction_event_id, EventType.REACTION)
@@ -2526,7 +2612,7 @@ class Portal(DBPortal, BasePortal):
             user.send_remote_checkpoint(
                 MessageSendCheckpointStatus.SUCCESS,
                 reaction_event_id,
-                self.mxid,
+                room_id,
                 EventType.REACTION,
             )
             await self._send_delivery_receipt(reaction_event_id)
@@ -2539,9 +2625,10 @@ class Portal(DBPortal, BasePortal):
         emoji_id: str,
         reaction: TypeReaction,
         reaction_event_id: EventID,
+        room_id: RoomID | None = None,
     ) -> None:
         tg_space = self.tgid if self.peer_type == "channel" else user.tgid
-        msg = await DBMessage.get_by_mxid(target_event_id, self.mxid, tg_space)
+        msg = await DBMessage.get_by_mxid(target_event_id, room_id or self.mxid, tg_space)
         if not msg:
             raise IgnoredMessageError(
                 f"Ignoring Matrix reaction to unknown event {target_event_id}"
@@ -2582,7 +2669,7 @@ class Portal(DBPortal, BasePortal):
         )
         await DBReaction(
             mxid=reaction_event_id,
-            mx_room=self.mxid,
+            mx_room=room_id or self.mxid,
             msg_mxid=msg.mxid,
             tg_sender=user.tgid,
             reaction=emoji_id,
@@ -2689,10 +2776,10 @@ class Portal(DBPortal, BasePortal):
         await self.update_bridge_info()
 
     async def handle_matrix_upgrade(
-        self, sender: UserID, new_room: RoomID, event_id: EventID
+        self, sender: UserID, new_room: RoomID, event_id: EventID, room_id: RoomID | None = None
     ) -> None:
         _, server = self.main_intent.parse_user_id(sender)
-        old_room = self.mxid
+        old_room = room_id or self.mxid
         await self.migrate_and_save_matrix(new_room)
         await self.main_intent.join_room(new_room, servers=[server])
         entity: TypeChat | User | None = None
@@ -2701,7 +2788,7 @@ class Portal(DBPortal, BasePortal):
             user = self.bot
             entity = await self.get_entity(self.bot)
         if not entity:
-            user_mxids = await self.main_intent.get_room_members(self.mxid)
+            user_mxids = await self.main_intent.get_room_members(new_room)
             for user_str in user_mxids:
                 user_id = UserID(user_str)
                 if user_id == self.az.bot_mxid:
@@ -2717,8 +2804,10 @@ class Portal(DBPortal, BasePortal):
             )
             return
         await self.update_matrix_room(user, entity)
-        self.log.info(f"{sender} upgraded room from {old_room} to {self.mxid}")
+        self.log.info(f"{sender} upgraded room from {old_room} to {new_room}")
         await self._send_delivery_receipt(event_id, room_id=old_room)
+        if room_id != self.mxid:
+            await pfm.PortalForumMapping.update_mxid(room_id, new_room)
 
     async def migrate_and_save_matrix(self, new_id: RoomID) -> None:
         try:
@@ -2734,12 +2823,12 @@ class Portal(DBPortal, BasePortal):
     # endregion
     # region Telegram -> Matrix bridging
 
-    async def handle_telegram_typing(self, user: p.Puppet, update: UpdateTyping) -> None:
+    async def handle_telegram_typing(self, user: p.Puppet, room_id: RoomID, update: UpdateTyping) -> None:
         if user.is_real_user:
             # Ignore typing notifications from double puppeted users to avoid echoing
             return
         is_typing = isinstance(update.action, SendMessageTypingAction)
-        await user.default_mxid_intent.set_typing(self.mxid, timeout=5000 if is_typing else 0)
+        await user.default_mxid_intent.set_typing(room_id, timeout=5000 if is_typing else 0)
 
     async def handle_telegram_edit(
         self, source: au.AbstractUser, sender: p.Puppet | None, evt: Message
@@ -2759,6 +2848,15 @@ class Portal(DBPortal, BasePortal):
 
         async with self.send_lock(sender_id, required=False):
             tg_space = self.tgid if self.peer_type == "channel" else source.tgid
+
+            room_id = self.mxid
+            forum_id = self.event_to_forum_id(evt)
+            if forum_id:
+                if forum_id in self.forum_by_id:
+                    room_id = self.forum_by_id[forum_id].mxid
+                elif self.config["bridge.relaybot.ignore_unbridged_forum"]:
+                    self.log.debug(f"Ignoring unbridged forum {source.tgid}/{forum_id}")
+                    return
 
             temporary_identifier = EventID(
                 f"${random.randint(1000000000000, 9999999999999)}TGBRIDGEDITEMP"
@@ -2780,7 +2878,7 @@ class Portal(DBPortal, BasePortal):
                         return
                     await DBMessage(
                         mxid=mxid,
-                        mx_room=self.mxid,
+                        mx_room=room_id,
                         tg_space=tg_space,
                         tgid=TelegramID(evt.id),
                         edit_index=prev_edit_msg.edit_index + 1,
@@ -2804,7 +2902,7 @@ class Portal(DBPortal, BasePortal):
                 f"Ignoring edit of message {evt.id}@{tg_space} (src {source.tgid}):"
                 " content hash didn't change"
             )
-            await DBMessage.delete_temp_mxid(temporary_identifier, self.mxid)
+            await DBMessage.delete_temp_mxid(temporary_identifier, room_id)
             return
 
         intent = sender.intent_for(self) if sender else self.main_intent
@@ -2813,7 +2911,7 @@ class Portal(DBPortal, BasePortal):
             source, intent, is_bot, self.is_channel, evt, no_reply_fallback=True
         )
         converted.content.set_edit(editing_msg.mxid)
-        await intent.set_typing(self.mxid, timeout=0)
+        await intent.set_typing(room_id, timeout=0)
         timestamp = evt.edit_date if evt.edit_date != evt.date else None
         event_id = await self._send_message(
             intent, converted.content, timestamp=timestamp, event_type=converted.type
@@ -2821,14 +2919,14 @@ class Portal(DBPortal, BasePortal):
 
         await DBMessage(
             mxid=event_id,
-            mx_room=self.mxid,
+            mx_room=room_id,
             tg_space=tg_space,
             tgid=TelegramID(evt.id),
             edit_index=prev_edit_msg.edit_index + 1,
             content_hash=event_hash,
             sender=sender_id,
         ).insert()
-        await DBMessage.replace_temp_mxid(temporary_identifier, self.mxid, event_id)
+        await DBMessage.replace_temp_mxid(temporary_identifier, room_id, event_id)
 
     @property
     def _backfill_config_type(self) -> str:
@@ -2928,6 +3026,7 @@ class Portal(DBPortal, BasePortal):
     async def _locked_backfill(
         self,
         source: u.User,
+        room_id: RoomID,
         client: MautrixTelegramClient,
         req: Backfill | None = None,
         forward: bool = False,
@@ -2939,7 +3038,7 @@ class Portal(DBPortal, BasePortal):
             return "Backfilling normal groups is disabled in the bridge config"
         tg_space = source.tgid if self.peer_type != "channel" else self.tgid
         if forward:
-            last_in_room = await DBMessage.find_last(self.mxid, tg_space)
+            last_in_room = await DBMessage.find_last(room_id, tg_space)
             min_id = last_in_room.tgid if last_in_room else 0
             if last_tgid is None:
                 messages = await source.client.get_messages(self.peer, limit=1)
@@ -2961,7 +3060,7 @@ class Portal(DBPortal, BasePortal):
             anchor_id = min_id
         else:
             limit = req.messages_per_batch
-            first_in_room = await DBMessage.find_first(self.mxid, tg_space)
+            first_in_room = await DBMessage.find_first(room_id, tg_space)
             anchor_id = first_in_room.tgid if first_in_room else None
             anchor_source = "lowest in chat"
             if req.anchor_msg_id and req.anchor_msg_id < anchor_id:
@@ -3036,6 +3135,7 @@ class Portal(DBPortal, BasePortal):
     async def _wrap_batch_msg(
         self,
         intent: IntentAPI,
+        room_id: RoomID,
         msg: Message,
         converted: putil.ConvertedMessage,
         caption: bool = False,
@@ -3048,7 +3148,7 @@ class Portal(DBPortal, BasePortal):
             content = converted.content
             event_type = converted.type
         if self.encrypted and self.matrix.e2ee:
-            event_type, content = await self.matrix.e2ee.encrypt(self.mxid, event_type, content)
+            event_type, content = await self.matrix.e2ee.encrypt(room_id, event_type, content)
         if intent.api.is_real_user:
             content[DOUBLE_PUPPET_SOURCE_KEY] = self.bridge.name
         return BatchSendEvent(
@@ -3062,6 +3162,7 @@ class Portal(DBPortal, BasePortal):
     async def _backfill_messages(
         self,
         source: u.User,
+        room_id: RoomID,
         client: MautrixTelegramClient,
         forward: bool,
         anchor_id: int,
@@ -3129,7 +3230,7 @@ class Portal(DBPortal, BasePortal):
         )
         if self._enable_batch_sending:
             resp = await self.main_intent.beeper_batch_send(
-                self.mxid,
+                room_id,
                 # We iterated the events in reverse chronological order,
                 # so reverse them before sending
                 events=list(reversed(events)),
@@ -3139,7 +3240,7 @@ class Portal(DBPortal, BasePortal):
         else:
             event_ids = [
                 await intent.send_message_event(
-                    self.mxid, evt.type, evt.content, timestamp=evt.timestamp
+                    room_id, evt.type, evt.content, timestamp=evt.timestamp
                 )
                 for evt, intent in zip(reversed(events), reversed(intents))
             ]
@@ -3148,7 +3249,7 @@ class Portal(DBPortal, BasePortal):
             [
                 DBMessage(
                     mxid=event_id,
-                    mx_room=self.mxid,
+                    mx_room=room_id,
                     tgid=msg.id,
                     tg_space=tg_space,
                     edit_index=0,
@@ -3187,7 +3288,7 @@ class Portal(DBPortal, BasePortal):
                 )
         return reactions
 
-    async def _poll_telegram_reactions(self, source: au.AbstractUser) -> None:
+    async def _poll_telegram_reactions(self, source: au.AbstractUser, room_id: RoomID) -> None:
         now = time.monotonic()
         if self._prev_reaction_poll[source.mxid] + REACTION_POLL_MIN_INTERVAL > now:
             self.log.trace(
@@ -3197,7 +3298,7 @@ class Portal(DBPortal, BasePortal):
             return
         self._prev_reaction_poll[source.mxid] = now
         self.log.debug(f"Polling reactions for recent messages through {source.mxid}")
-        messages = await DBMessage.find_recent(self.mxid, source.tgid)
+        messages = await DBMessage.find_recent(room_id, source.tgid)
         message_ids = [message.tgid for message in messages]
         updates = await source.client(GetMessagesReactionsRequest(peer=self.peer, id=message_ids))
         for user in updates.users:
@@ -3439,6 +3540,21 @@ class Portal(DBPortal, BasePortal):
                     ),
                 )
 
+    async def _send_message_room(
+        self,
+        intent: IntentAPI,
+        room_id: RoomID,
+        content: MessageEventContent,
+        event_type: EventType = EventType.ROOM_MESSAGE,
+        **kwargs,
+    ) -> EventID:
+        if self.encrypted and self.matrix.e2ee:
+            event_type, content = await self.matrix.e2ee.encrypt(room_id, event_type, content)
+        event_id = await intent.send_message_event(room_id, event_type, content, **kwargs)
+        if intent.api.is_real_user:
+            background_task.create(intent.mark_read(room_id, event_id))
+        return event_id
+
     async def _handle_telegram_message(
         self, source: au.AbstractUser, sender: p.Puppet | None, evt: Message
     ) -> None:
@@ -3464,6 +3580,26 @@ class Portal(DBPortal, BasePortal):
             )
             return
 
+        room_id = self.mxid
+        forum_id = self.event_to_forum_id(evt)
+        if forum_id:
+            if forum_id in self.forum_by_id:
+                room_id = self.forum_by_id[forum_id].mxid
+            elif self.config["bridge.relaybot.ignore_unbridged_forums"]:
+                self.log.debug(f"Ignoring unbridged forum {source.tgid}/{forum_id}")
+                return
+
+        # reply_to_msg_id = reply_to
+        # reply_to_top_id = None
+        # if room_id in self.forum_by_mxid:
+        #     forum_mapping = self.forum_by_mxid[room_id]
+        #     reply_to_msg_id = forum_mapping.tg_forum_id
+        #     reply_to_top_id = reply_to
+        #
+        # if reply_to:
+        #     reply_to = InputReplyToMessage(reply_to_msg_id=reply_to_msg_id,
+        #                                    top_msg_id=reply_to_top_id)
+
         sender_id = sender.tgid if sender else self.tgid
         async with self.send_lock(sender_id, required=False):
             tg_space = self.tgid if self.peer_type == "channel" else source.tgid
@@ -3481,7 +3617,7 @@ class Portal(DBPortal, BasePortal):
                 if tg_space != other_tg_space:
                     await DBMessage(
                         tgid=TelegramID(evt.id),
-                        mx_room=self.mxid,
+                        mx_room=room_id,
                         mxid=mxid,
                         tg_space=tg_space,
                         edit_index=0,
@@ -3534,13 +3670,13 @@ class Portal(DBPortal, BasePortal):
         converted = await self._msg_conv.convert(source, intent, is_bot, self.is_channel, evt)
         if not converted:
             return
-        await intent.set_typing(self.mxid, timeout=0)
-        event_id = await self._send_message(
-            intent, converted.content, timestamp=evt.date, event_type=converted.type
+        await intent.set_typing(room_id, timeout=0)
+        event_id = await self._send_message_room(
+            intent, room_id, converted.content, timestamp=evt.date, event_type=converted.type
         )
         caption_id = None
         if converted.caption:
-            caption_id = await self._send_message(intent, converted.caption, timestamp=evt.date)
+            caption_id = await self._send_message_room(intent, room_id, converted.caption, timestamp=evt.date)
 
         self._new_messages_after_sponsored = True
 
@@ -3557,14 +3693,14 @@ class Portal(DBPortal, BasePortal):
                 "to other clients before responding to the sender. I'll just redact "
                 "the likely duplicate message now."
             )
-            await intent.redact(self.mxid, event_id)
+            await intent.redact(room_id, event_id)
             return
 
         self.log.debug("Handled Telegram message %d@%d -> %s", evt.id, tg_space, event_id)
         try:
             dbm = DBMessage(
                 tgid=TelegramID(evt.id),
-                mx_room=self.mxid,
+                mx_room=room_id,
                 mxid=event_id,
                 tg_space=tg_space,
                 edit_index=0,
@@ -3572,13 +3708,13 @@ class Portal(DBPortal, BasePortal):
                 sender=sender_id,
             )
             await dbm.insert()
-            await DBMessage.replace_temp_mxid(temporary_identifier, self.mxid, event_id)
+            await DBMessage.replace_temp_mxid(temporary_identifier, room_id, event_id)
         except (IntegrityError, UniqueViolationError) as e:
             self.log.error(
                 f"{type(e).__name__} while saving message mapping {evt.id}@{tg_space} "
                 f"-> {event_id}: {e}"
             )
-            await intent.redact(self.mxid, event_id)
+            await intent.redact(room_id, event_id)
             return
         if isinstance(evt, Message) and evt.reactions:
             background_task.create(
@@ -3586,21 +3722,25 @@ class Portal(DBPortal, BasePortal):
                     source, dbm.tgid, evt.reactions, dbm=dbm, timestamp=evt.date
                 )
             )
-        await self._send_delivery_receipt(event_id)
+        await self._send_delivery_receipt(event_id, room_id)
         if converted.disappear_seconds:
             if converted.disappear_start_immediately:
                 expires_at = int(evt.date.timestamp()) + converted.disappear_seconds
             else:
                 expires_at = None
-            await self._mark_disappearing(event_id, converted.disappear_seconds, expires_at)
+            await self._mark_disappearing(room_id, event_id, converted.disappear_seconds, expires_at)
             if caption_id:
-                await self._mark_disappearing(caption_id, converted.disappear_seconds, expires_at)
+                await self._mark_disappearing(room_id, caption_id, converted.disappear_seconds, expires_at)
 
     async def _mark_disappearing(
-        self, event_id: EventID, seconds: int, expires_at: int | None
+        self,
+        room_id: RoomID,
+        event_id: EventID,
+        seconds: int,
+        expires_at: int | None,
     ) -> None:
         dm = DisappearingMessage(
-            self.mxid, event_id, seconds, expiration_ts=expires_at * 1000 if expires_at else None
+            room_id, event_id, seconds, expiration_ts=expires_at * 1000 if expires_at else None
         )
         await dm.insert()
         if expires_at:
@@ -3650,6 +3790,13 @@ class Portal(DBPortal, BasePortal):
             return
         if isinstance(action, MessageActionChatEditTitle):
             await self._update_title(action.title, sender=sender, save=True)
+            await self.update_bridge_info()
+        elif isinstance(action, MessageActionTopicEdit):
+            if not update.reply_to or not update.reply_to.forum_topic:
+                self.log.warning("Handle Telegram action: Got MessageActionTopicEdit, but not a forum topic")
+                return
+            forum_id = update.reply_to.reply_to_msg_id
+            await self._update_topic(forum_id, action.title, sender=sender, save=True)
             await self.update_bridge_info()
         elif isinstance(action, MessageActionChatEditPhoto):
             await self._update_avatar(source, action.photo, sender=sender, save=True)
@@ -3898,7 +4045,8 @@ class Portal(DBPortal, BasePortal):
                 await self.main_intent.remove_room_alias(self.alias_localpart)
             except (MatrixRequestError, IntentError):
                 self.log.warning("Failed to remove alias when cleaning up room", exc_info=True)
-        await self.cleanup_room(self.main_intent, self.mxid, message, puppets_only)
+        for mxid in [self.mxid, *self.forum_mxids]:
+            await self.cleanup_room(self.main_intent, mxid, message, puppets_only)
         if delete:
             await self.delete()
 
@@ -3941,6 +4089,27 @@ class Portal(DBPortal, BasePortal):
         if self.mxid:
             self.by_mxid[self.mxid] = self
 
+        if self.tgid and self.tg_receiver:
+            await self.update_forum_mappings()
+
+    async def update_forum_mappings(self):
+        if self.tgid:
+            self.forum_by_id = {}
+            self.forum_by_mxid = {}
+            self.forum_by_tgid = {}
+            self.tgid_by_mxid = {}
+            for mapping in await pfm.PortalForumMapping.get_for_portal(self.tgid, self.tg_receiver):
+                self.forum_by_id[mapping.tg_forum_id] = mapping
+                self.forum_by_mxid[mapping.mxid] = mapping
+                self.forum_by_tgid[(mapping.portal_tgid, mapping.portal_tg_receiver)] = mapping
+                self.tgid_by_mxid[mapping.mxid] = (mapping.portal_tgid, mapping.portal_tg_receiver)
+            self.forum_mxids = list(self.forum_by_mxid.keys())
+
+    def event_to_forum_id(self, evt: Message):
+        if evt.reply_to and evt.reply_to.forum_topic:
+            return evt.reply_to.reply_to_top_id or evt.reply_to.reply_to_msg_id
+        return None
+
     @classmethod
     async def _yield_portals(
         cls, query: Awaitable[list[DBPortal]]
@@ -3965,6 +4134,17 @@ class Portal(DBPortal, BasePortal):
     @classmethod
     def find_private_chats_with(cls, tgid: TelegramID) -> AsyncGenerator[Portal, None]:
         return cls._yield_portals(super().find_private_chats_with(tgid))
+
+    @classmethod
+    @async_getter_lock
+    async def get_by_forum_mxid(cls, mxid: RoomID, /) -> tuple[Portal, pfm.PortalForumMapping] | None:
+        forum_mapping = await pfm.PortalForumMapping.get_by_mxid(mxid)
+        if forum_mapping:
+            portal = await cls.get_by_tgid(forum_mapping.portal_tgid)
+            if portal:
+                return portal, forum_mapping
+        return None, None
+
 
     @classmethod
     @async_getter_lock
