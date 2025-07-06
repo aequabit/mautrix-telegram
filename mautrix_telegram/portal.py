@@ -2442,6 +2442,7 @@ class Portal(DBPortal, BasePortal):
                 sender,
                 logged_in,
                 event_id,
+                room_id,
                 space,
                 client,
                 content,

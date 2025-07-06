@@ -66,12 +66,14 @@ class MautrixTelegramClient(TelegramClient):
         reply_to: int = None,
     ) -> Optional[Message]:
         entity = await self.get_input_entity(entity)
-        reply_to = utils.get_message_id(reply_to)
+        if reply_to and not isinstance(reply_to, InputReplyToMessage):
+            message_id = utils.get_message_id(reply_to)
+            reply_to = InputReplyToMessage(reply_to_msg_id=message_id)
         request = SendMediaRequest(
             entity,
             media,
             message=caption or "",
             entities=entities or [],
-            reply_to=InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to else None,
+            reply_to=reply_to,
         )
         return self._get_response_message(request, await self(request), entity)
