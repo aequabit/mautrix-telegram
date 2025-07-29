@@ -2914,8 +2914,8 @@ class Portal(DBPortal, BasePortal):
         converted.content.set_edit(editing_msg.mxid)
         await intent.set_typing(room_id, timeout=0)
         timestamp = evt.edit_date if evt.edit_date != evt.date else None
-        event_id = await self._send_message(
-            intent, converted.content, timestamp=timestamp, event_type=converted.type
+        event_id = await self._send_message_room(
+            intent, room_id, converted.content, timestamp=timestamp, event_type=converted.type
         )
 
         await DBMessage(
