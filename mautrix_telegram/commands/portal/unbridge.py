@@ -27,6 +27,7 @@ from .util import user_has_power_level
 async def _get_portal_and_check_permission(evt: CommandEvent) -> tuple[po.Portal | None, po.PortalForumMapping | None]:
     room_id = RoomID(evt.args[0]) if len(evt.args) > 0 else evt.room_id
     portal = await po.Portal.get_by_mxid(room_id)
+    forum_mapping = None
     if not portal:
         portal, forum_mapping = await po.Portal.get_by_forum_mxid(evt.room_id)
 
